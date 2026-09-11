@@ -22,6 +22,9 @@ local backend_video_url =
 local player_update_url =
     "https://hixkwi5b5gxj.share.zrok.io/musica.lua"
 
+local cache_clear_url =
+    "https://hixkwi5b5gxj.share.zrok.io/clear-cache"
+
 
 local width, height = term.getSize()
 local tab = 1 -- 1=Search, 2=Playlist, 3=Queue
@@ -408,7 +411,31 @@ local function downloadLatestPlayer()
     file.write(code)
     file.close()
 
-    return true, nil
+    local cache_response, cache_error =
+        http.get(
+            cache_clear_url,
+            nil,
+            true
+        )
+
+    if not cache_response then
+        fs.delete("musica.lua.new")
+        return false,
+            cache_error or "Cache deletion request failed"
+    end
+
+    local cache_message = cache_response.readAll() or ""
+    cache_response.close()
+
+    if not cache_message:match("^Cache deleted:") then
+        fs.delete("musica.lua.new")
+        return false,
+            cache_message ~= ""
+            and cache_message
+            or "Cache deletion failed"
+    end
+
+    return true, cache_message
 end
 
 local function replacePlayerFile()
@@ -1870,7 +1897,7 @@ local function uiLoop()
                         or update_char then
 
                         local updated,
-                              update_error =
+                            update_message =
                             downloadLatestPlayer()
 
                         term.setCursorPos(
@@ -1886,9 +1913,9 @@ local function uiLoop()
 
                         term.write(
                             updated
-                            and "Downloaded musica.lua.new"
+                            and update_message
                             or "Update failed: "
-                            .. update_error
+                            .. update_message
                         )
 
                         sleep(1.5)
