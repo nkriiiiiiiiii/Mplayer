@@ -14,16 +14,16 @@ local api_base_url = "https://ipod-2to6magyna-uc.a.run.app/"
 local version = "2.1"
 
 local backend_url =
-    "https://hixkwi5b5gxj.share.zrok.io/convert?url="
+    "https://v3avh45znhnh.share.zrok.io/convert?url="
 
 local backend_video_url =
-    "https://hixkwi5b5gxj.share.zrok.io/convertVideo?url="
+    "https://v3avh45znhnh.share.zrok.io/convertVideo?url="
 
 local player_update_url =
-    "https://hixkwi5b5gxj.share.zrok.io/musica.lua"
+    "https://v3avh45znhnh.share.zrok.io/musica.lua"
 
 local cache_clear_url =
-    "https://hixkwi5b5gxj.share.zrok.io/clear-cache"
+    "https://v3avh45znhnh.share.zrok.io/clear-cache"
 
 
 local width, height = term.getSize()
@@ -60,10 +60,12 @@ local last_rendered_frame = nil
 local dfpwm_bytes_per_second = 6000
 
 -- Video synchronization
-local VIDEO_PREBUFFER_FRAMES = 30
+-- Start as soon as the first frame is available; the rolling producer
+-- continues filling the buffer while audio and video are already playing.
+local VIDEO_PREBUFFER_FRAMES = 1
 
 -- Rolling video buffer
-local VIDEO_BUFFER_SECONDS = 4
+local VIDEO_BUFFER_SECONDS = 8
 local video_streaming = false
 local video_stream_handle = nil
 local video_stream_coroutine = nil
@@ -178,6 +180,18 @@ local function stopVideoStream()
     video_stream_coroutine = nil
 end
 
+local function clearPlayedCache()
+    local response = http.get(
+        cache_clear_url,
+        nil,
+        true
+    )
+
+    if response then
+        response.close()
+    end
+end
+
 local function streamNFV(url)
     stopVideoStream()
 
@@ -197,7 +211,7 @@ local function streamNFV(url)
     local stream_width,
           stream_height,
           stream_fps =
-        header:match("(%d+)%s+(%d+)%s+(%d+)")
+                header:match("(%d+)%s+(%d+)%s+([%d%.]+)")
 
     stream_width = tonumber(stream_width)
     stream_height = tonumber(stream_height)
@@ -250,37 +264,52 @@ local function streamNFV(url)
             and video_streaming
             and currentVideo == video do
 
-            local frame = handle.readLine()
+            local target_frame =
+                math.floor(
+                    audioPosition * video.fps
+                ) + 1
 
-            if not frame then
-                break
+            if video.last_frame - target_frame
+                >= video.buffer_size then
+
+                -- Keep the producer from running so far ahead that it
+                -- overwrites frames the player has not displayed yet.
+                coroutine.yield()
+
+            else
+
+                local frame = handle.readLine()
+
+                if not frame then
+                    break
+                end
+
+                video.received_frames =
+                    video.received_frames + 1
+
+                local frame_number =
+                    video.received_frames
+
+                local index =
+                    ((frame_number - 1)
+                    % video.buffer_size) + 1
+
+                video.frames[index] = frame
+
+                video.last_frame = frame_number
+
+                if video.last_frame -
+                   video.first_frame + 1
+                   > video.buffer_size then
+
+                    video.first_frame =
+                        video.last_frame
+                        - video.buffer_size
+                        + 1
+                end
+
+                coroutine.yield()
             end
-
-            video.received_frames =
-                video.received_frames + 1
-
-            local frame_number =
-                video.received_frames
-
-            local index =
-                ((frame_number - 1)
-                % video.buffer_size) + 1
-
-            video.frames[index] = frame
-
-            video.last_frame = frame_number
-
-            if video.last_frame -
-               video.first_frame + 1
-               > video.buffer_size then
-
-                video.first_frame =
-                    video.last_frame
-                    - video.buffer_size
-                    + 1
-            end
-
-            coroutine.yield()
         end
 
         pcall(function()
@@ -378,10 +407,41 @@ end
 -- PLAYER UPDATE
 -----------------------------
 
+local function clearBackendCache()
+    local cache_response, cache_error =
+        http.get(
+            cache_clear_url,
+            nil,
+            true
+        )
+
+    if not cache_response then
+        return false,
+            cache_error or "Cache deletion request failed"
+    end
+
+    local cache_message = cache_response.readAll() or ""
+    cache_response.close()
+
+    if not cache_message:match("^Cache deleted:") then
+        return false,
+            cache_message ~= ""
+            and cache_message
+            or "Cache deletion failed"
+    end
+
+    return true, cache_message
+end
+
 local function downloadLatestPlayer()
+    local update_url =
+        player_update_url
+        .. "?t="
+        .. os.epoch("utc")
+
     local response, request_error =
         http.get(
-            player_update_url,
+            update_url,
             nil,
             true
         )
@@ -411,28 +471,12 @@ local function downloadLatestPlayer()
     file.write(code)
     file.close()
 
-    local cache_response, cache_error =
-        http.get(
-            cache_clear_url,
-            nil,
-            true
-        )
+    local cache_cleared, cache_message =
+        clearBackendCache()
 
-    if not cache_response then
+    if not cache_cleared then
         fs.delete("musica.lua.new")
-        return false,
-            cache_error or "Cache deletion request failed"
-    end
-
-    local cache_message = cache_response.readAll() or ""
-    cache_response.close()
-
-    if not cache_message:match("^Cache deleted:") then
-        fs.delete("musica.lua.new")
-        return false,
-            cache_message ~= ""
-            and cache_message
-            or "Cache deletion failed"
+        return false, cache_message
     end
 
     return true, cache_message
@@ -534,10 +578,9 @@ end
 renderCurrentVideoFrame = function()
 
     if not video_monitor
-        or not playingVideo
         or not currentVideo then
 
-        return
+        return false
     end
 
     local video = currentVideo
@@ -557,7 +600,7 @@ renderCurrentVideoFrame = function()
     if video.last_frame <
        video.first_frame then
 
-        return
+        return false
     end
 
     if target_frame >
@@ -581,13 +624,13 @@ renderCurrentVideoFrame = function()
         )
 
     if not frame then
-        return
+        return false
     end
 
     if frame ==
        last_rendered_frame then
 
-        return
+        return true
     end
 
     local rows = {}
@@ -642,6 +685,8 @@ renderCurrentVideoFrame = function()
 
     last_rendered_frame =
         frame
+
+    return true
 end
 
 -----------------------------
@@ -1605,12 +1650,8 @@ local function redrawScreen()
     term.setCursorBlink(
         false
     )
-
-    term.setBackgroundColor(
-        colors.black
-    )
-
-    term.clear()
+                                                    -- Keep audio stopped when
+                                                    -- video cannot start.
 
     term.setCursorPos(
         width,
@@ -1965,6 +2006,8 @@ local function uiLoop()
 
                             stopVideoStream()
 
+                            clearPlayedCache()
+
                             playingVideo =
                                 false
 
@@ -2208,6 +2251,34 @@ local function uiLoop()
 
                                 stopVideoStream()
 
+                                local cache_cleared,
+                                      cache_message =
+                                    clearBackendCache()
+
+                                term.setCursorPos(
+                                    2,
+                                    2
+                                )
+
+                                term.setTextColor(
+                                    cache_cleared
+                                    and colors.green
+                                    or colors.red
+                                )
+
+                                term.write(
+                                    cache_cleared
+                                    and cache_message
+                                    or "Cache clear failed: "
+                                    .. cache_message
+                                )
+
+                                if not cache_cleared then
+                                    sleep(1.5)
+                                    redrawScreen()
+                                    return
+                                end
+
                                 tape.seek(
                                     -99999999999
                                 )
@@ -2222,6 +2293,13 @@ local function uiLoop()
                                 tape.seek(
                                     -99999999999
                                 )
+
+                                if video_monitor then
+                                    video_monitor.setBackgroundColor(
+                                        colors.black
+                                    )
+                                    video_monitor.clear()
+                                end
 
                                 redrawScreen()
 
@@ -2479,9 +2557,6 @@ local function uiLoop()
                                                         currentVideo
                                                     )
 
-                                                    -- Reset the audio clock
-                                                    -- immediately before start.
-
                                                     tape.seek(
                                                         -999999999999999
                                                     )
@@ -2495,25 +2570,22 @@ local function uiLoop()
                                                     playingVideo =
                                                         true
 
-                                                    -- Audio now starts at
-                                                    -- exactly the same logical
-                                                    -- zero point as video.
+                                                    local video_started =
+                                                        renderCurrentVideoFrame()
 
-                                                    tape.play()
-
-                                                    renderCurrentVideoFrame()
+                                                    if video_started then
+                                                        tape.play()
+                                                    else
+                                                        playingVideo = false
+                                                    end
 
                                                 else
 
-                                                    -- If video could not
-                                                    -- start, audio still works.
-
-                                                    tape.play()
+                                                    -- Keep audio stopped when
+                                                    -- video cannot start.
                                                 end
 
                                             elseif not video_monitor then
-
-                                                tape.play()
 
                                                 term.setCursorPos(
                                                     2,
@@ -2532,7 +2604,6 @@ local function uiLoop()
 
                                             else
 
-                                                tape.play()
                                             end
                                         end
 
